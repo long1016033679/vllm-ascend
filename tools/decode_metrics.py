@@ -254,8 +254,127 @@ def percentile(values: list[float], q: float) -> float:
     return xs[lo] if lo == hi else xs[lo] * (hi - pos) + xs[hi] * (pos - lo)
 
 
+def describe(values: list[float]) -> dict[str, float]:
+    values = [value for value in values if math.isfinite(value)]
+    if not values:
+        return {name: math.nan for name in ("average", "min", "max", "median", "p99")}
+    return {
+        "average": statistics.fmean(values),
+        "min": min(values),
+        "max": max(values),
+        "median": statistics.median(values),
+        "p99": percentile(values, 0.99),
+    }
+
+
 def fmt(value: float, digits: int = 3) -> str:
     return "N/A" if math.isnan(value) else f"{value:.{digits}f}"
+
+
+def record_window(
+    total: Aggregate,
+    writer: csv.writer,
+    fp,
+    excel_rows: list[list[object]],
+    ts: str,
+    w: Window,
+) -> None:
+    total.add(w)
+    kv_pct = 100.0 * w.kv_avg if not math.isnan(w.kv_avg) else math.nan
+    writer.writerow(
+        [
+            ts,
+            f"{w.dt:.6f}",
+            w.running,
+            int(round(w.dgen)),
+            f"{w.tps:.6f}",
+            f"{w.tpot_ms:.6f}",
+            fmt(kv_pct, 6),
+        ]
+    )
+    fp.flush()
+    excel_rows.append(
+        [
+            ts,
+            w.dt,
+            w.running,
+            int(round(w.dgen)),
+            w.tps,
+            w.tpot_ms,
+            None if math.isnan(kv_pct) else kv_pct,
+        ]
+    )
+
+
+def write_xlsx(
+    path: Path, excel_rows: list[list[object]], summary: dict[str, object]
+) -> bool:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError:
+        print(
+            "[DECODE_MONITOR_WARN] openpyxl is not installed; XLSX output skipped. "
+            "Install it with: pip install openpyxl",
+            file=sys.stderr,
+        )
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    samples_ws = workbook.active
+    samples_ws.title = "samples"
+    header = [
+        "timestamp",
+        "dt_s",
+        "running",
+        "generation_tokens",
+        "tps",
+        "tpot_ms",
+        "kv_usage_pct",
+    ]
+    samples_ws.append(header)
+    for cell in samples_ws[1]:
+        cell.font = Font(bold=True)
+    for row in excel_rows:
+        samples_ws.append(row)
+
+    summary_ws = workbook.create_sheet("summary")
+    summary_ws.append(["metric", "average", "min", "max", "median", "p99"])
+    for cell in summary_ws[1]:
+        cell.font = Font(bold=True)
+    tps_stats = summary.get("tps_stats", {})
+    tpot_stats = summary.get("tpot_ms_stats", {})
+    summary_ws.append(
+        ["TPS"] + [tps_stats.get(name) for name in ("average", "min", "max", "median", "p99")]
+    )
+    summary_ws.append(
+        ["TPOT_ms"]
+        + [tpot_stats.get(name) for name in ("average", "min", "max", "median", "p99")]
+    )
+    summary_ws.append([])
+    summary_ws.append(["field", "value"])
+    summary_ws[5][0].font = Font(bold=True)
+    summary_ws[5][1].font = Font(bold=True)
+    for key in (
+        "status",
+        "end_reason",
+        "expected_running",
+        "measurement_samples",
+        "measurement_seconds",
+        "generation_tokens",
+        "steady_tps",
+        "steady_tpot_ms",
+        "window_tps_cv",
+        "model_name",
+        "finished_at",
+    ):
+        value = summary.get(key)
+        if value is not None:
+            summary_ws.append([key, value])
+
+    workbook.save(path)
+    return True
 
 
 def run_self_test() -> None:
@@ -285,6 +404,8 @@ vllm:kv_cache_usage_perc{engine="1",model_name="glm5-1"} 0.3
     reset = Snapshot(40, 0, 1, 1, 2, 0, 0.25, {}, {})
     assert delta(changed, reset) is None
     assert cv([100, 101, 99, 100]) < 0.01
+    stats = describe([1.0, 2.0, 3.0])
+    assert stats["average"] == 2.0 and stats["median"] == 2.0
     print("self-test: PASS")
 
 
@@ -322,6 +443,7 @@ def parser() -> argparse.ArgumentParser:
         help="0 means until tail/Ctrl-C.",
     )
     p.add_argument("--csv", default="decode_steady_metrics.csv")
+    p.add_argument("--xlsx", default="decode_steady_metrics.xlsx")
     p.add_argument("--summary-json", default="decode_steady_summary.json")
     p.add_argument("--per-engine", action="store_true")
     p.add_argument("--self-test", action="store_true")
@@ -358,7 +480,7 @@ def main() -> int:
         return 0
 
     endpoints = list(dict.fromkeys(normalize_endpoint(e) for e in args.endpoint))
-    csv_path, summary_path = Path(args.csv), Path(args.summary_json)
+    csv_path, xlsx_path, summary_path = Path(args.csv), Path(args.xlsx), Path(args.summary_json)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     stop = False
 
@@ -378,8 +500,9 @@ def main() -> int:
     phase = "WAIT_DECODE"
     armed = 0
     decode_start = 0.0
-    candidates: deque[float] = deque(maxlen=args.steady_samples)
+    candidates: deque[tuple[str, Window]] = deque(maxlen=args.steady_samples)
     total = Aggregate()
+    excel_rows: list[list[object]] = []
     end_reason = "unknown"
 
     print(
@@ -403,6 +526,7 @@ def main() -> int:
                 "kv_usage_pct",
             ]
         )
+        fp.flush()
 
         while not stop:
             time.sleep(args.interval)
@@ -465,8 +589,8 @@ def main() -> int:
                     candidates.clear()
                     print("[DECODE_STEADY_ARM_RESET] decode-only condition lost")
                 else:
-                    candidates.append(w.tps)
-                    rolling_cv = cv(list(candidates))
+                    candidates.append((ts, w))
+                    rolling_cv = cv([candidate.tps for _, candidate in candidates])
                     print(
                         f"[DECODE_STEADY_ARM] "
                         f"samples={len(candidates)}/{args.steady_samples} "
@@ -481,6 +605,23 @@ def main() -> int:
                             f"[DECODE_STEADY_BEGIN] running={w.running} "
                             f"rolling_CV={rolling_cv:.4f} timestamp={ts}"
                         )
+                        # These windows already satisfied the steady criteria;
+                        # seed them into the final measurement immediately so a
+                        # short decode does not lose all rows before the first tail.
+                        for candidate_ts, candidate in candidates:
+                            record_window(
+                                total,
+                                writer,
+                                fp,
+                                excel_rows,
+                                candidate_ts,
+                                candidate,
+                            )
+                        print(
+                            f"[DECODE_STEADY_SEEDED] samples={total.samples} "
+                            f"TPS={total.tps:.3f} TPOT_ms={total.tpot_ms:.3f}"
+                        )
+                        candidates.clear()
 
             elif phase == "MEASURE":
                 if w.running < args.expected_running:
@@ -497,19 +638,7 @@ def main() -> int:
                         f"d_gen={int(round(w.dgen))}"
                     )
                 else:
-                    total.add(w)
-                    writer.writerow(
-                        [
-                            ts,
-                            f"{w.dt:.6f}",
-                            w.running,
-                            int(round(w.dgen)),
-                            f"{w.tps:.6f}",
-                            f"{w.tpot_ms:.6f}",
-                            fmt(kv_pct, 6),
-                        ]
-                    )
-                    fp.flush()
+                    record_window(total, writer, fp, excel_rows, ts, w)
                     extra = ""
                     if args.per_engine:
                         items = []
@@ -551,7 +680,9 @@ def main() -> int:
 
     if total.samples:
         final_cv = cv(total.tps_windows)
-        summary = {
+        tps_stats = describe(total.tps_windows)
+        tpot_stats = describe(total.tpot_windows)
+        summary: dict[str, object] = {
             "status": "ok",
             "end_reason": end_reason,
             "expected_running": args.expected_running,
@@ -560,42 +691,61 @@ def main() -> int:
             "generation_tokens": int(round(total.tokens)),
             "steady_tps": total.tps,
             "steady_tpot_ms": total.tpot_ms,
-            "window_tps_median": statistics.median(total.tps_windows),
-            "window_tpot_ms_median": statistics.median(total.tpot_windows),
+            "tps_stats": tps_stats,
+            "tpot_ms_stats": tpot_stats,
+            "window_tps_average": tps_stats["average"],
+            "window_tps_min": tps_stats["min"],
+            "window_tps_max": tps_stats["max"],
+            "window_tps_median": tps_stats["median"],
+            "window_tps_p99": tps_stats["p99"],
+            "window_tpot_ms_average": tpot_stats["average"],
+            "window_tpot_ms_min": tpot_stats["min"],
+            "window_tpot_ms_max": tpot_stats["max"],
+            "window_tpot_ms_median": tpot_stats["median"],
+            "window_tpot_ms_p99": tpot_stats["p99"],
             "window_tps_cv": final_cv,
-            "window_tps_p10": percentile(total.tps_windows, 0.10),
-            "window_tps_p90": percentile(total.tps_windows, 0.90),
-            "window_tpot_ms_p10": percentile(total.tpot_windows, 0.10),
-            "window_tpot_ms_p90": percentile(total.tpot_windows, 0.90),
             "endpoints": endpoints,
             "model_name": args.model_name,
-            "finished_at": datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            ),
+            "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         write_json(summary_path, summary)
+        xlsx_written = write_xlsx(xlsx_path, excel_rows, summary)
         print(
             f"[DECODE_STEADY_FINAL] reason={end_reason} "
             f"samples={total.samples} duration={total.seconds:.3f}s "
             f"gen_tokens={int(round(total.tokens))} TPS={total.tps:.3f} "
             f"TPOT_ms={total.tpot_ms:.3f} TPS_CV={final_cv:.4f} "
-            f"summary={summary_path} csv={csv_path}"
+            f"summary={summary_path} csv={csv_path} "
+            f"xlsx={xlsx_path if xlsx_written else 'N/A'}"
+        )
+        print(
+            "[DECODE_STATS] "
+            f"TPS(avg/min/max/median/p99)="
+            f"{tps_stats['average']:.3f}/{tps_stats['min']:.3f}/"
+            f"{tps_stats['max']:.3f}/{tps_stats['median']:.3f}/"
+            f"{tps_stats['p99']:.3f} "
+            f"TPOT_ms(avg/min/max/median/p99)="
+            f"{tpot_stats['average']:.3f}/{tpot_stats['min']:.3f}/"
+            f"{tpot_stats['max']:.3f}/{tpot_stats['median']:.3f}/"
+            f"{tpot_stats['p99']:.3f}"
         )
         return 0
 
-    write_json(
-        summary_path,
-        {
-            "status": "no_steady_samples",
-            "end_reason": end_reason,
-            "expected_running": args.expected_running,
-            "endpoints": endpoints,
-            "model_name": args.model_name,
-        },
-    )
+    summary = {
+        "status": "no_steady_samples",
+        "end_reason": end_reason,
+        "expected_running": args.expected_running,
+        "tps_stats": describe([]),
+        "tpot_ms_stats": describe([]),
+        "endpoints": endpoints,
+        "model_name": args.model_name,
+        "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    write_json(summary_path, summary)
+    write_xlsx(xlsx_path, excel_rows, summary)
     print(
         f"[DECODE_STEADY_FINAL] status=no_steady_samples "
-        f"reason={end_reason} summary={summary_path}"
+        f"reason={end_reason} summary={summary_path} csv={csv_path} xlsx={xlsx_path}"
     )
     return 1
 
