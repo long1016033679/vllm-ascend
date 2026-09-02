@@ -1,12 +1,16 @@
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
+
+from vllm_ascend import envs as envs_ascend
+from vllm_ascend.utils import kv_debug_format_ids
 
 
 class BlockTable:
@@ -400,10 +404,30 @@ class MultiGroupBlockTable:
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
+        if envs_ascend.VLLM_ASCEND_KV_DEBUG:
+            try:
+                logger.info(
+                    "[KV_DEBUG][BLK_TABLE] append_row(运行中请求追加新块): row=%d 各group新增块=%s "
+                    "→ 各group累计块数=%s",
+                    row_idx,
+                    [list(b) for b in block_ids],
+                    [int(bt.num_blocks_per_row[row_idx]) for bt in self.block_tables],
+                )
+            except Exception:
+                logger.debug("[KV_DEBUG] append_row log error", exc_info=True)
 
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
+        if envs_ascend.VLLM_ASCEND_KV_DEBUG:
+            try:
+                logger.info(
+                    "[KV_DEBUG][BLK_TABLE] add_row(新请求首次登记,占一行): row=%d 各group块列表=%s",
+                    row_idx,
+                    [kv_debug_format_ids(b) for b in block_ids],
+                )
+            except Exception:
+                logger.debug("[KV_DEBUG] add_row log error", exc_info=True)
 
     def clear_row(self, row_idx: int) -> None:
         for block_table in self.block_tables:
@@ -432,6 +456,27 @@ class MultiGroupBlockTable:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
             else:
                 block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+        if envs_ascend.VLLM_ASCEND_KV_DEBUG:
+            try:
+                num_tokens = positions.shape[0]
+                logger.info(
+                    "[KV_DEBUG][SLOT] compute_slot_mapping: 本步token数=%d positions(每个token在序列中的绝对位置)=%s",
+                    num_tokens,
+                    kv_debug_format_ids(positions.tolist()),
+                )
+                for i, block_table in enumerate(self.block_tables):
+                    if block_table.is_mamba_group:
+                        continue
+                    slots = block_table.slot_mapping.gpu[:num_tokens].tolist()
+                    logger.info(
+                        "[KV_DEBUG][SLOT] group[%d] slot_mapping=%s "
+                        "(含义: slot = block_id*%d + 块内偏移, 即该token的KV写入cache tensor的一维位置)",
+                        i,
+                        kv_debug_format_ids(slots),
+                        block_table.block_size,
+                    )
+            except Exception:
+                logger.debug("[KV_DEBUG] compute_slot_mapping log error", exc_info=True)
 
     def compute_slot_mapping_draft(
         self,
@@ -451,6 +496,18 @@ class MultiGroupBlockTable:
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
             block_table.commit_block_table(num_reqs)
+        if envs_ascend.VLLM_ASCEND_KV_DEBUG:
+            try:
+                logger.info(
+                    "[KV_DEBUG][BLK_TABLE] commit_block_table: 把CPU侧的block_table整表同步到NPU, num_reqs=%d "
+                    "各请求已用块数(group0)=%s",
+                    num_reqs,
+                    kv_debug_format_ids(self.block_tables[0].num_blocks_per_row[:num_reqs].tolist())
+                    if self.block_tables
+                    else "[]",
+                )
+            except Exception:
+                logger.debug("[KV_DEBUG] commit_block_table log error", exc_info=True)
 
     def clear(self) -> None:
         for block_table in self.block_tables:

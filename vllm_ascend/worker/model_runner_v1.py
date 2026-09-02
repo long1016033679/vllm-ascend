@@ -102,6 +102,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -158,8 +159,10 @@ from vllm_ascend.utils import (
     get_c_env,
     global_stream,
     is_hidden_state_cache_spec,
+    is_kv_cache_debug_enabled,
     kv_cache_spec_uses_sparse_li_c8,
     kv_cache_spec_uses_sparse_sfa_c8,
+    kv_debug_format_ids,
     lmhead_tp_enable,
     oproj_tp_enable,
     set_potential_max_tokens,
@@ -741,7 +744,41 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        return super()._update_states(scheduler_output)
+        result = super()._update_states(scheduler_output)
+        if is_kv_cache_debug_enabled():
+            self._log_block_table_update_for_debug(scheduler_output)
+        return result
+
+    def _log_block_table_update_for_debug(self, scheduler_output: "SchedulerOutput") -> None:
+        """[KV_DEBUG] Print each scheduled request's block table row.
+
+        The block table row is the request -> physical blocks mapping used
+        by attention kernels; it is the same block id list the scheduler
+        allocated in KVCacheManager.allocate_slots.
+        """
+        try:
+            block_table = self.input_batch.block_table[0]
+            req_data = scheduler_output.scheduled_cached_reqs
+            for i, req_id in enumerate(req_data.req_ids):
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    continue
+                num_blocks = int(block_table.num_blocks_per_row[req_index])
+                row = block_table.get_numpy_array()[req_index, :num_blocks].tolist()
+                new_block_ids = req_data.new_block_ids[i] if i < len(req_data.new_block_ids) else None
+                new_flat = [b for group in (new_block_ids or ()) for b in group]
+                num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                logger.info(
+                    "[KV_DEBUG][BLK_TABLE] req=%s row=%d: 已计算token=%d | 该请求当前占用 %d 个块: %s | 本步新增块: %s",
+                    req_id,
+                    req_index,
+                    num_computed,
+                    num_blocks,
+                    kv_debug_format_ids(row),
+                    kv_debug_format_ids(new_flat),
+                )
+        except Exception:
+            logger.debug("[KV_DEBUG] block table update log error", exc_info=True)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -1285,6 +1322,21 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
+
+        if envs_ascend.VLLM_ASCEND_KV_DEBUG:
+            try:
+                logger.info(
+                    "[KV_DEBUG][PREPARE] 本步输入准备: 请求数=%d 总token=%d 各请求本步token=%s "
+                    "各请求已计算token=%s seq_lens(上下文总长=已计算+本步)=%s attn_state=%s",
+                    num_reqs,
+                    total_num_scheduled_tokens,
+                    kv_debug_format_ids(num_scheduled_tokens.tolist()),
+                    kv_debug_format_ids(self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()),
+                    kv_debug_format_ids(self.seq_lens[:num_reqs].tolist()),
+                    attn_state.name,
+                )
+            except Exception:
+                logger.debug("[KV_DEBUG] prepare inputs log error", exc_info=True)
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -3031,6 +3083,35 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
+    def _log_block_table_and_slots_for_debug(
+        self,
+        kv_cache_gid: int,
+        blk_table_tensor: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_reqs: int,
+        num_tokens: int,
+    ) -> None:
+        """[KV_DEBUG] Print per-group block table and slot_mapping tensors.
+
+        ``blk_table_tensor`` row r is request r's physical block id list
+        (what the attention kernel uses to find past KV); ``slot_mapping``
+        entry t is token t's write position (block_id * block_size + offset).
+        """
+        try:
+            num_show = min(num_reqs, 4)
+            rows = [kv_debug_format_ids(blk_table_tensor[r].tolist()) for r in range(num_show)]
+            logger.info(
+                "[KV_DEBUG][ATTN_META] group=%d: block_table(每行=一个请求的物理块id列表, 展示前%d行)=%s "
+                "| slot_mapping(每个token的KV写入位置, 共%d个)=%s",
+                kv_cache_gid,
+                num_show,
+                rows,
+                num_tokens,
+                kv_debug_format_ids(slot_mapping[:num_tokens].tolist()),
+            )
+        except Exception:
+            logger.debug("[KV_DEBUG] attn meta log error", exc_info=True)
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -3140,6 +3221,10 @@ class NPUModelRunner(GPUModelRunner):
                     self.routed_experts_slot_mapping_device[:n].copy_(
                         slot_mapping
                     )
+            if envs_ascend.VLLM_ASCEND_KV_DEBUG:
+                self._log_block_table_and_slots_for_debug(
+                    kv_cache_gid, blk_table_tensor, slot_mapping, num_reqs, num_tokens
+                )
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
@@ -3863,6 +3948,8 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if is_kv_cache_debug_enabled():
+            self._log_kv_cache_init_for_debug(kv_cache_config, kv_caches)
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -3885,6 +3972,60 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def _log_kv_cache_init_for_debug(
+        self, kv_cache_config: KVCacheConfig, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """[KV_DEBUG] Print the KV cache pool layout after initialization.
+
+        This is the Worker-process view of the same block pool the scheduler
+        allocates from: num_blocks blocks, each block stores block_size
+        tokens' KV for every layer of the group.
+        """
+        try:
+            num_blocks = kv_cache_config.num_blocks
+            logger.info("[KV_DEBUG][INIT] ============ KV Cache 张量初始化完成 (Worker 进程) ============")
+            logger.info(
+                "[KV_DEBUG][INIT] 物理块池 num_blocks=%d, 共 %d 个 kv_cache_group "
+                "(和Scheduler侧块池是同一套block编号)",
+                num_blocks,
+                len(kv_cache_config.kv_cache_groups),
+            )
+            total_bytes = 0
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                block_size = int(getattr(spec, "block_size", 0) or 0)
+                page_size = int(getattr(spec, "page_size_bytes", 0) or 0)
+                total_bytes += page_size * num_blocks
+                per_token_kb = (page_size / block_size / 1024) if block_size else 0
+                logger.info(
+                    "[KV_DEBUG][INIT] group[%d]: block_size=%d (1个block存%d个token) | 本组层数=%d | "
+                    "1个block占显存 %.2f MiB(该组所有层合计) | 每个token的KV占 %.1f KB(该组所有层合计)",
+                    gid,
+                    block_size,
+                    block_size,
+                    len(group.layer_names),
+                    page_size / 1048576,
+                    per_token_kb,
+                )
+                logger.info("[KV_DEBUG][INIT] group[%d] 层列表(前5个): %s", gid, list(group.layer_names[:5]))
+            logger.info(
+                "[KV_DEBUG][INIT] KV池总显存 = %.2f GiB", total_bytes / 1073741824
+            )
+            if kv_caches:
+                sample_name, sample_tensor = next(iter(kv_caches.items()))
+                logger.info(
+                    "[KV_DEBUG][INIT] 单层KV tensor示例 %s: shape=%s "
+                    "(dense模型期望 [2, num_blocks, block_size, num_kv_heads, head_size], 第1维2表示K和V各一份)",
+                    sample_name,
+                    tuple(sample_tensor.shape),
+                )
+            logger.info(
+                "[KV_DEBUG][INIT] 核心公式: token的物理slot = block_id * block_size + 块内偏移; "
+                "每层attention用 BlockTable 的行(块id列表)读历史KV, 用 slot_mapping(写入位置)写新KV"
+            )
+        except Exception:
+            logger.debug("[KV_DEBUG] kv cache init log error", exc_info=True)
 
     def _bind_routed_experts_capturer(self, capturer=None) -> None:
         if vllm_version_is("0.23.0"):

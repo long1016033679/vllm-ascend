@@ -22,6 +22,7 @@ import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
 import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
 import vllm_ascend.patch.platform.patch_use_v2_model_runner  # noqa
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.utils import is_310p, vllm_version_is
 
 if not is_310p():
@@ -51,6 +52,9 @@ import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 
 import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
 import vllm_ascend.patch.platform.patch_speculative_config  # noqa
+
+if vllm_version_is("0.23.0") and envs_ascend.VLLM_ASCEND_KV_DEBUG:
+    import vllm_ascend.patch.platform.patch_kv_cache_debug  # noqa
 
 if not vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_fused_moe  # noqa

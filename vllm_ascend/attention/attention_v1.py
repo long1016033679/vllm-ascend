@@ -23,6 +23,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -66,7 +67,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.utils import weak_ref_tensors
+from vllm_ascend.utils import is_kv_cache_debug_enabled, kv_debug_format_ids, weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
@@ -1528,6 +1529,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         output_padded = None
         if key is not None and value is not None:
+            if is_kv_cache_debug_enabled():
+                try:
+                    logger.info(
+                        "[KV_DEBUG][KV_WRITE] layer=%s 把本步K/V写入cache: 真实token数=%d attn_state=%s "
+                        "slot_mapping(每个token的写入位置)=%s 本层cache形状=%s",
+                        layer.layer_name,
+                        attn_metadata.num_actual_tokens,
+                        attn_metadata.attn_state.name,
+                        kv_debug_format_ids(attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].tolist()),
+                        tuple(kv_cache[0].shape) if kv_cache is not None else None,
+                    )
+                except Exception:
+                    logger.debug("[KV_DEBUG] kv write log error", exc_info=True)
             output_padded = output
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output

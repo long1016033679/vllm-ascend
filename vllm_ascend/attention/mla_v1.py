@@ -61,6 +61,8 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_device_type,
     get_weight_prefetch_method,
+    is_kv_cache_debug_enabled,
+    kv_debug_format_ids,
     maybe_trans_nz,
     weak_ref_tensors,
 )
@@ -1763,6 +1765,21 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
                 layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
             )
+        if is_kv_cache_debug_enabled():
+            try:
+                slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+                logger.info(
+                    "[KV_DEBUG][KV_WRITE] layer=%s (MLA) 把本步KV写入compressed cache: 真实token数=%d "
+                    "slot_mapping=%s 本层cache形状=%s",
+                    layer_name,
+                    num_actual_tokens,
+                    kv_debug_format_ids(slot_mapping[:num_actual_tokens].tolist())
+                    if slot_mapping is not None
+                    else "N/A",
+                    tuple(kv_cache[0].shape) if kv_cache is not None else None,
+                )
+            except Exception:
+                logger.debug("[KV_DEBUG] mla kv write log error", exc_info=True)
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             output_decode = self._forward_decode(

@@ -23,6 +23,7 @@ import functools
 import json
 import math
 import os
+from collections.abc import Iterable
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -78,6 +79,29 @@ _CUSTOM_OP_VENDOR_DIR = "custom_transformer"
 _CUSTOM_OP_BASE_DIR = (
     os.path.dirname(__file__) if os.path.isabs(__file__) else os.path.abspath(os.path.dirname(__file__))
 )
+
+
+def is_kv_cache_debug_enabled() -> bool:
+    """Whether VLLM_ASCEND_KV_DEBUG verbose KV cache logging is enabled.
+
+    All log lines produced by this switch are tagged with "[KV_DEBUG]".
+    """
+    return envs_ascend.VLLM_ASCEND_KV_DEBUG
+
+
+def kv_debug_format_ids(ids: Iterable[Any], max_items: int = 16) -> str:
+    """Format an id list for "[KV_DEBUG]" logs, truncating long lists.
+
+    Example: "[1, 2, 3, ... (共100个) ... 98, 99, 100]"
+    """
+    try:
+        values = [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return str(ids)
+    if len(values) <= max_items:
+        return str(values)
+    half = max_items // 2
+    return f"{values[:half]} ... (共{len(values)}个) ... {values[-half:]}"
 
 
 def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:

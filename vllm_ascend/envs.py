@@ -110,6 +110,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable verbose KV cache debug logs (all lines tagged "[KV_DEBUG]")
+    # for learning/debugging how KV cache works for a single request: block pool
+    # allocation/free, prefix cache hits, per-request block lists (BlockTable),
+    # slot_mapping computation and per-layer KV cache writes.
+    # 0: disabled (default); 1: enabled.
+    # WARNING: debugging only. Logs are very verbose and slow down serving.
+    "VLLM_ASCEND_KV_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_KV_DEBUG", "0"))),
 }
 
 # end-env-vars-definition
