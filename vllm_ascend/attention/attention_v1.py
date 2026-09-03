@@ -67,7 +67,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.utils import is_kv_cache_debug_enabled, kv_debug_format_ids, weak_ref_tensors
+from vllm_ascend.utils import is_kv_cache_debug_enabled, weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
@@ -1531,14 +1531,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if key is not None and value is not None:
             if is_kv_cache_debug_enabled():
                 try:
+                    cache_shape = (
+                        tuple(self.key_cache.shape)
+                        if self.key_cache is not None
+                        else (tuple(kv_cache[0].shape) if kv_cache is not None else None)
+                    )
+                    block_size = cache_shape[1] if cache_shape and len(cache_shape) > 1 else 0
+                    slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].tolist()
+                    decomp_parts = []
+                    for s in slots[:3]:
+                        if block_size and s >= 0:
+                            bid = s // block_size
+                            off = s % block_size
+                            decomp_parts.append(f"slot{s}=块{bid}*{block_size}+{off}→kv_cache[0][{bid}][{off}]")
+                        else:
+                            decomp_parts.append(f"slot{s}")
                     logger.info(
-                        "[KV_DEBUG][KV_WRITE] layer=%s 把本步K/V写入cache: 真实token数=%d attn_state=%s "
-                        "slot_mapping(每个token的写入位置)=%s 本层cache形状=%s",
+                        "[KV_DEBUG][KV_WRITE] layer=%s 写入KV: token数=%d attn_state=%s cache形状=%s "
+                        "| 前3个slot分解: %s",
                         layer.layer_name,
                         attn_metadata.num_actual_tokens,
                         attn_metadata.attn_state.name,
-                        kv_debug_format_ids(attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens].tolist()),
-                        tuple(kv_cache[0].shape) if kv_cache is not None else None,
+                        cache_shape,
+                        " | ".join(decomp_parts),
+                    )
+                    logger.info(
+                        "[KV_DEBUG][KV_WRITE] layer=%s 关键: 所有层共用同一份slot_mapping, "
+                        "但各自写入自己的kv_cache → 同一个slot在不同层是不同的内存块",
+                        layer.layer_name,
                     )
                 except Exception:
                     logger.debug("[KV_DEBUG] kv write log error", exc_info=True)

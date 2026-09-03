@@ -477,6 +477,50 @@ class MultiGroupBlockTable:
                     )
             except Exception:
                 logger.debug("[KV_DEBUG] compute_slot_mapping log error", exc_info=True)
+            try:
+                bt0 = self.block_tables[0]
+                num_show = min(3, num_tokens)
+                logger.info(
+                    "[KV_DEBUG][SLOT][DERIVE] ======== slot 逐token推导 "
+                    "(以 row 0 第一个请求为例, block_size=%d) ========",
+                    bt0.block_size,
+                )
+                for t in range(num_show):
+                    pos = int(positions[t])
+                    block_idx = pos // bt0.block_size
+                    if block_idx < bt0.max_num_blocks_per_req:
+                        block_id = int(bt0.block_table.np[0, block_idx])
+                        offset = pos % bt0.block_size
+                        slot = block_id * bt0.block_size + offset
+                        logger.info(
+                            "[KV_DEBUG][SLOT][DERIVE]   token#%d: pos=%d → 逻辑块idx=%d "
+                            "→ block_table[0,%d]=物理块id=%d → slot=%d*%d+%d=%d "
+                            "(即写入 kv_cache[0][%d][%d])",
+                            t,
+                            pos,
+                            block_idx,
+                            block_idx,
+                            block_id,
+                            block_id,
+                            bt0.block_size,
+                            offset,
+                            slot,
+                            block_id,
+                            offset,
+                        )
+                    else:
+                        logger.info(
+                            "[KV_DEBUG][SLOT][DERIVE]   token#%d: pos=%d → 逻辑块idx=%d 超出范围, 跳过",
+                            t,
+                            pos,
+                            block_idx,
+                        )
+                logger.info(
+                    "[KV_DEBUG][SLOT][DERIVE] 关键: slot = block_id * block_size + offset; "
+                    "同一份 slot_mapping 被所有层共用, 每层按 slot 写入自己的 kv_cache[layer]"
+                )
+            except Exception:
+                logger.debug("[KV_DEBUG] slot derive log error", exc_info=True)
 
     def compute_slot_mapping_draft(
         self,

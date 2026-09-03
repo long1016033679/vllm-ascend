@@ -226,9 +226,11 @@ _original_schedule = Scheduler.schedule
 
 @wraps(_original_schedule)
 def _patched_schedule(self, *args: Any, **kwargs: Any):
+    self._kv_debug_step_count = getattr(self, "_kv_debug_step_count", 0) + 1
     try:
         logger.info(
-            "[KV_DEBUG][STEP] ====== 新调度步开始: running=%d waiting=%d 空闲块=%d/%d ======",
+            "[KV_DEBUG][STEP] ====== 调度步 #%d 开始: running=%d waiting=%d 空闲块=%d/%d ======",
+            self._kv_debug_step_count,
             len(self.running),
             len(self.waiting),
             self.kv_cache_manager.block_pool.get_num_free_blocks(),
@@ -260,8 +262,9 @@ def _patched_update_after_schedule(self, scheduler_output, *args: Any, **kwargs:
             if not counts:
                 state = "请求本步已完成(块已归还块池)"
             logger.info(
-                "[KV_DEBUG][SCHED] 调度结果: req=%s 本步调度token=%s 已计算token=%s "
+                "[KV_DEBUG][SCHED] 步#%d 调度结果: req=%s 本步调度token=%s 已计算token=%s "
                 "| 该请求%s 本步新增块id=%s | 空闲块=%d/%d",
+                getattr(self, "_kv_debug_step_count", 0),
                 req_id,
                 num_scheduled,
                 num_computed,

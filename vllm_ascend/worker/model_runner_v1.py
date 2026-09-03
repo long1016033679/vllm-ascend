@@ -3098,14 +3098,45 @@ class NPUModelRunner(GPUModelRunner):
         entry t is token t's write position (block_id * block_size + offset).
         """
         try:
-            num_show = min(num_reqs, 4)
-            rows = [kv_debug_format_ids(blk_table_tensor[r].tolist()) for r in range(num_show)]
+            group = self.kv_cache_config.kv_cache_groups[kv_cache_gid]
+            num_layers_in_group = len(group.layer_names)
             logger.info(
-                "[KV_DEBUG][ATTN_META] group=%d: block_table(每行=一个请求的物理块id列表, 展示前%d行)=%s "
-                "| slot_mapping(每个token的KV写入位置, 共%d个)=%s",
+                "[KV_DEBUG][ATTN_META][GROUP] group=%d: 本组含 %d 层 attention, 共享同一 block_table 和 slot_mapping",
                 kv_cache_gid,
-                num_show,
-                rows,
+                num_layers_in_group,
+            )
+            logger.info(
+                "[KV_DEBUG][ATTN_META][GROUP] group=%d: block_table 形状 %s "
+                "= [num_reqs_padded, max_num_blocks_per_req], 每行=一个请求的物理块id列表",
+                kv_cache_gid,
+                tuple(blk_table_tensor.shape),
+            )
+            logger.info(
+                "[KV_DEBUG][ATTN_META][GROUP] group=%d: slot_mapping 形状 [%d] "
+                "= [num_tokens], 每个token一个写入位置(slot)",
+                kv_cache_gid,
+                slot_mapping.shape[0],
+            )
+            logger.info(
+                "[KV_DEBUG][ATTN_META][GROUP] group=%d: 这 %d 层共用上述映射, 但各自读写自己的 kv_cache[layer]",
+                kv_cache_gid,
+                num_layers_in_group,
+            )
+            bt = self.input_batch.block_table[kv_cache_gid]
+            num_show = min(num_reqs, 4)
+            for r in range(num_show):
+                actual = int(bt.num_blocks_per_row[r]) if r < len(bt.num_blocks_per_row) else 0
+                row = blk_table_tensor[r].tolist()
+                logger.info(
+                    "[KV_DEBUG][ATTN_META][ROW] group=%d row=%d: 有效块数=%d 块列表=%s (其余位置填0, 不使用)",
+                    kv_cache_gid,
+                    r,
+                    actual,
+                    kv_debug_format_ids(row[:actual]) if actual else "[]",
+                )
+            logger.info(
+                "[KV_DEBUG][ATTN_META][SLOT] group=%d slot_mapping(共%d个)=%s",
+                kv_cache_gid,
                 num_tokens,
                 kv_debug_format_ids(slot_mapping[:num_tokens].tolist()),
             )
@@ -4014,15 +4045,102 @@ class NPUModelRunner(GPUModelRunner):
             )
             if kv_caches:
                 sample_name, sample_tensor = next(iter(kv_caches.items()))
+                if isinstance(sample_tensor, (list, tuple)):
+                    sample_shape = tuple(sample_tensor[0].shape)
+                else:
+                    sample_shape = tuple(sample_tensor.shape)
                 logger.info(
                     "[KV_DEBUG][INIT] 单层KV tensor示例 %s: shape=%s "
                     "(dense模型期望 [2, num_blocks, block_size, num_kv_heads, head_size], 第1维2表示K和V各一份)",
                     sample_name,
-                    tuple(sample_tensor.shape),
+                    sample_shape,
+                )
+
+            # ---- TENSOR ↔ LAYER 映射 ----
+            layer_items = list(kv_caches.items())
+            total_layers = len(layer_items)
+            logger.info("[KV_DEBUG][INIT][TENSOR↔LAYER] ======== 每层 KV tensor 与 block 的对应关系 ========")
+            show_indices = list(range(min(3, total_layers)))
+            if total_layers > 3:
+                show_indices.append(total_layers - 1)
+            for idx in show_indices:
+                name, kv = layer_items[idx]
+                if isinstance(kv, (list, tuple)):
+                    shape = tuple(kv[0].shape)
+                else:
+                    shape = tuple(kv.shape)
+                logger.info(
+                    "[KV_DEBUG][INIT][TENSOR↔LAYER]   layer[%d] %s: kv_cache shape=%s",
+                    idx,
+                    name,
+                    shape,
+                )
+            if total_layers > 4:
+                logger.info(
+                    "[KV_DEBUG][INIT][TENSOR↔LAYER]   ... (共 %d 层, 每层都有独立但同形状的 kv_cache tensor)",
+                    total_layers,
                 )
             logger.info(
-                "[KV_DEBUG][INIT] 核心公式: token的物理slot = block_id * block_size + 块内偏移; "
-                "每层attention用 BlockTable 的行(块id列表)读历史KV, 用 slot_mapping(写入位置)写新KV"
+                "[KV_DEBUG][INIT][TENSOR↔LAYER] 关键关系:"
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][TENSOR↔LAYER]   1. 共 %d 层, 每层有自己的 kv_cache tensor, "
+                "但都按同一套 block_id (0~%d) 编号",
+                total_layers,
+                num_blocks - 1,
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][TENSOR↔LAYER]   2. block_id=N 在 layer A 是 kv_cache_A[N], "
+                "在 layer B 是 kv_cache_B[N] — 不同内存, 同编号"
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][TENSOR↔LAYER]   3. 请求的 block_table 行 [3, 7, 12] 表示: "
+                "该请求的 KV 分别存在每层的 block 3, 7, 12"
+            )
+
+            # ---- BLOCK ↔ TENSOR 映射 ----
+            block_size_0 = int(
+                getattr(kv_cache_config.kv_cache_groups[0].kv_cache_spec, "block_size", 0) or 0
+            )
+            logger.info("[KV_DEBUG][INIT][BLOCK↔TENSOR] ======== block 到 tensor 位置的映射 ========")
+            logger.info(
+                "[KV_DEBUG][INIT][BLOCK↔TENSOR]   block_id=N, 第 i 个 token (i=0~%d) "
+                "的 K 数据 → kv_cache[layer][0][N][i]",
+                block_size_0 - 1 if block_size_0 else "?",
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][BLOCK↔TENSOR]   block_id=N, 第 i 个 token 的 V 数据 "
+                "→ kv_cache[layer][1][N][i]"
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][BLOCK↔TENSOR]   reshape_and_cache(key, ..., slot_mapping=[slot_t]) "
+                "把 token t 的 K 写到 kv_cache[0].view(-1)[slot_t]"
+            )
+
+            # ---- 整体关系总结 ----
+            logger.info("[KV_DEBUG][INIT][SUMMARY] ======== 整体数据关系总结 ========")
+            logger.info(
+                "[KV_DEBUG][INIT][SUMMARY]   块池: %d 个物理块 (编号 0~%d), 所有请求共享, 调度器分配/释放",
+                num_blocks,
+                num_blocks - 1,
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][SUMMARY]   每层: kv_cache[layer] 形状 [2, %d, %d, "
+                "num_kv_heads, head_size], K和V各一份",
+                num_blocks,
+                block_size_0,
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][SUMMARY]   映射: 请求 block_table 行 [B0, B1, ...] "
+                "→ 每层 kv_cache[layer][0][B0] 是该请求第0段KV"
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][SUMMARY]   写入: slot_mapping[t] = block_id * %d + offset "
+                "→ kv_cache[layer][0].flatten()[slot]",
+                block_size_0,
+            )
+            logger.info(
+                "[KV_DEBUG][INIT][SUMMARY]   读取: attention 用 block_table 行找历史KV, 用 slot_mapping 写新KV"
             )
         except Exception:
             logger.debug("[KV_DEBUG] kv cache init log error", exc_info=True)
